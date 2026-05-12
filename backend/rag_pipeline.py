@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import List
 
@@ -14,6 +15,8 @@ from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnableP
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
+from backend.chat_store import get_memory_summary, get_recent_messages, set_memory_summary
+
 load_dotenv()
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -23,11 +26,21 @@ INDEX_ROOT.mkdir(parents=True, exist_ok=True)
 DOC_ROOT.mkdir(parents=True, exist_ok=True)
 
 
+@lru_cache(maxsize=1)
 def get_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+@lru_cache(maxsize=128)
+def _load_vectorstore_cached(index_dir: str) -> FAISS:
+    return FAISS.load_local(
+        index_dir,
+        get_embeddings(),
+        allow_dangerous_deserialization=True,
     )
 
 
@@ -84,6 +97,8 @@ def build_or_load_index(
 
     index_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(index_dir))
+    # Rebuilt indexes should invalidate loaded FAISS cache.
+    _load_vectorstore_cached.cache_clear()
     (index_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -120,23 +135,93 @@ def list_indexed_documents() -> List[dict]:
     return sorted(items, key=lambda x: x["pdf_path"])
 
 
-def ask_question(index_dir: str, question: str, k: int = 4) -> str:
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise ValueError("GOOGLE_API_KEY is not set. Add it to your .env file.")
-
-    embeddings = get_embeddings()
-    vectorstore = FAISS.load_local(
-        index_dir,
-        embeddings,
-        allow_dangerous_deserialization=True,
-    )
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
-
-    llm = ChatGoogleGenerativeAI(
+def _get_llm() -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(
         model="gemini-3-flash-preview",
         temperature=0,
         google_api_key=os.getenv("GOOGLE_API_KEY"),
     )
+
+
+def _answer_general_question(
+    question: str,
+    memory_summary: str = "",
+    chat_history: List[dict] | None = None,
+) -> str:
+    chat_history_text = _format_chat_history(chat_history or [])
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a helpful assistant. Use memory and recent chat for continuity."),
+            (
+                "human",
+                "Memory summary:\n{memory_summary}\n\nRecent conversation:\n{chat_history}\n\nQuestion: {question}",
+            ),
+        ]
+    )
+    parser = StrOutputParser()
+    chain = prompt | _get_llm() | parser
+    return chain.invoke(
+        {
+            "memory_summary": memory_summary or "None",
+            "chat_history": chat_history_text or "None",
+            "question": question,
+        }
+    )
+
+
+def _format_chat_history(chat_history: List[dict]) -> str:
+    lines: List[str] = []
+    for msg in chat_history:
+        role = (msg.get("role", "") or "").strip().lower()
+        content = (msg.get("content", "") or "").strip()
+        if not content:
+            continue
+        if role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"User: {content}")
+    return "\n".join(lines)
+
+
+def update_memory_summary_for_session(session_id: str, window_size: int = 20) -> None:
+    recent = get_recent_messages(session_id, limit=window_size)
+    if not recent:
+        return
+
+    existing_summary = get_memory_summary(session_id)
+    history_text = _format_chat_history(recent)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You maintain conversation memory. Keep a concise summary of durable user preferences, goals, and key facts."
+                " Avoid temporary details and keep it under 10 bullet points.",
+            ),
+            (
+                "human",
+                "Existing summary:\n{existing_summary}\n\nRecent conversation:\n{history_text}\n\nReturn updated summary only.",
+            ),
+        ]
+    )
+    parser = StrOutputParser()
+    chain = prompt | _get_llm() | parser
+    updated_summary = chain.invoke(
+        {
+            "existing_summary": existing_summary or "None",
+            "history_text": history_text or "None",
+        }
+    )
+    set_memory_summary(session_id, updated_summary.strip())
+
+
+def ask_question(index_dir: str, question: str, k: int = 4) -> str:
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("GOOGLE_API_KEY is not set. Add it to your .env file.")
+
+    vectorstore = _load_vectorstore_cached(index_dir)
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
+
+    llm = _get_llm()
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", "Answer ONLY from the provided context. If not found, say you don't know."),
@@ -161,57 +246,109 @@ def ask_question(index_dir: str, question: str, k: int = 4) -> str:
     return chain.invoke(question)
 
 
-def ask_question_across_documents(question: str, k: int = 4) -> dict:
+def ask_question_across_documents(
+    question: str,
+    k: int = 4,
+    allow_general_fallback: bool = True,
+    memory_summary: str = "",
+    chat_history: List[dict] | None = None,
+) -> dict:
     if not os.getenv("GOOGLE_API_KEY"):
         raise ValueError("GOOGLE_API_KEY is not set. Add it to your .env file.")
 
     indexed_docs = list_indexed_documents()
     if not indexed_docs:
+        if allow_general_fallback:
+            return {
+                "answer": _answer_general_question(
+                    question,
+                    memory_summary=memory_summary,
+                    chat_history=chat_history,
+                ),
+                "source_documents": [],
+                "response_mode": "general",
+            }
         raise ValueError("No indexed PDFs found. Please index documents from the Admin page.")
 
-    embeddings = get_embeddings()
     all_hits = []
 
     for item in indexed_docs:
         index_dir = item["index_dir"]
         pdf_name = item.get("pdf_name") or Path(item.get("pdf_path", "")).name
-        vectorstore = FAISS.load_local(
-            index_dir,
-            embeddings,
-            allow_dangerous_deserialization=True,
-        )
+        vectorstore = _load_vectorstore_cached(index_dir)
         hits = vectorstore.similarity_search_with_score(question, k=k)
         for doc, score in hits:
             all_hits.append((doc, float(score), pdf_name))
 
     if not all_hits:
-        return {
-            "answer": "I don't know based on the indexed documents.",
-            "source_documents": [],
-        }
+        if allow_general_fallback:
+            return {
+                "answer": _answer_general_question(
+                    question,
+                    memory_summary=memory_summary,
+                    chat_history=chat_history,
+                ),
+                "source_documents": [],
+                "response_mode": "general",
+            }
+        return {"answer": "I don't know based on the indexed documents.", "source_documents": [], "response_mode": "rag"}
 
     all_hits.sort(key=lambda x: x[1])
+
     top_hits = all_hits[:k]
     context_docs = [hit[0] for hit in top_hits]
     source_documents = sorted({hit[2] for hit in top_hits if hit[2]})
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3-flash-preview",
-        temperature=0,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-    )
+    llm = _get_llm()
+    chat_history_text = _format_chat_history(chat_history or [])
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", "Answer ONLY from the provided context. If not found, say you don't know."),
-            ("human", "Question: {question}\n\nContext:\n{context}"),
+            (
+                "system",
+                "Use the memory summary and recent conversation for continuity.\n"
+                "Answer ONLY from the provided document context for factual claims.\n"
+                "If the context does not contain the answer, say you don't know.",
+            ),
+            (
+                "human",
+                "Memory summary:\n{memory_summary}\n\nRecent conversation:\n{chat_history}\n\nQuestion: {question}\n\nContext:\n{context}",
+            ),
         ]
     )
     parser = StrOutputParser()
     chain = prompt | llm | parser
     context = "\n\n".join(doc.page_content for doc in context_docs)
-    answer = chain.invoke({"question": question, "context": context})
+    answer = chain.invoke(
+        {
+            "memory_summary": memory_summary or "None",
+            "chat_history": chat_history_text or "None",
+            "question": question,
+            "context": context,
+        }
+    )
+
+    # If RAG context could not answer, fallback to general LLM knowledge.
+    answer_text = answer.strip().lower()
+    rag_unknown_markers = [
+        "i don't know",
+        "i do not know",
+        "not found",
+        "cannot find",
+        "no information",
+    ]
+    if allow_general_fallback and any(marker in answer_text for marker in rag_unknown_markers):
+        return {
+            "answer": _answer_general_question(
+                question,
+                memory_summary=memory_summary,
+                chat_history=chat_history,
+            ),
+            "source_documents": [],
+            "response_mode": "general",
+        }
 
     return {
         "answer": answer,
         "source_documents": source_documents,
+        "response_mode": "rag",
     }

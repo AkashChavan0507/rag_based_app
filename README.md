@@ -38,4 +38,13 @@ streamlit run app.py
 2. Upload one or more PDF files.
 3. Click **Process and index uploaded files**.
 4. Return to **Local PDF RAG Chatbot** page.
-5. Ask questions; the app searches across all indexed PDFs and shows source document names.
+5. Use sidebar conversations (**New chat**, history list, delete current chat).
+6. Ask questions; the app searches across all indexed PDFs and shows source document names.
+7. Enable **Allow general answers** to let the assistant answer general questions when document retrieval is weak.
+
+## Chat history storage
+
+- Chat sessions are stored in JSON at `data/chat_sessions.json`.
+- Each session contains:
+  - `id`, `title`, `created_at`, `updated_at`
+  - `messages` with `role`, `content`, `ts`
