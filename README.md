@@ -1,6 +1,7 @@
 # Streamlit RAG App
 - Chat page for asking questions from indexed PDFs.
 - Admin page for uploading PDFs and building local FAISS indexes.
+- Detailed architecture and component documentation: `DOCUMENTATION.md`.
 
 ## Folder structure
 
