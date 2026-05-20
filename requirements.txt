@@ -1,4 +1,6 @@
 streamlit
+flask
+requests
 python-dotenv
 langchain
 langchain-community

@@ -20,8 +20,9 @@ from backend.chat_store import get_memory_summary, get_recent_messages, set_memo
 load_dotenv()
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-INDEX_ROOT = Path(".indices")
-DOC_ROOT = Path("data/docs")
+APP_ROOT = Path(__file__).resolve().parents[1]
+INDEX_ROOT = APP_ROOT / ".indices"
+DOC_ROOT = APP_ROOT / "data" / "docs"
 INDEX_ROOT.mkdir(parents=True, exist_ok=True)
 DOC_ROOT.mkdir(parents=True, exist_ok=True)
 

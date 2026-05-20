@@ -57,6 +57,7 @@ session = get_session(st.session_state.active_session_id)
 if not session:
     st.session_state.active_session_id = create_session()
     session = get_session(st.session_state.active_session_id)
+active_session_id = st.session_state.active_session_id
 
 chat_history = session.get("messages", [])
 for message in chat_history:
@@ -67,9 +68,9 @@ for message in chat_history:
 
 user_question = st.chat_input("Ask a question from any indexed PDF")
 if user_question:
-    prior_history = get_recent_messages(st.session_state.active_session_id, limit=12)
-    memory_summary = get_memory_summary(st.session_state.active_session_id)
-    add_message(st.session_state.active_session_id, "user", user_question)
+    prior_history = get_recent_messages(active_session_id, limit=12)
+    memory_summary = get_memory_summary(active_session_id)
+    add_message(active_session_id, "user", user_question)
     with st.chat_message("user"):
         st.markdown(user_question)
 
@@ -93,5 +94,5 @@ if user_question:
             except Exception as exc:
                 answer = f"Error: {exc}"
             st.markdown(answer)
-            add_message(st.session_state.active_session_id, "assistant", answer)
-            update_memory_summary_for_session(st.session_state.active_session_id)
+            add_message(active_session_id, "assistant", answer)
+            update_memory_summary_for_session(active_session_id)

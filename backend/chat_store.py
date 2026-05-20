@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-CHAT_STORE_PATH = Path("data/chat_sessions.json")
+APP_ROOT = Path(__file__).resolve().parents[1]
+CHAT_STORE_PATH = APP_ROOT / "data" / "chat_sessions.json"
 CHAT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
